@@ -1,0 +1,369 @@
+<?xml version="1.0"?>
+<Graphs xmlns="https://poets-project.org/schemas/virtual-graph-schema-v2">
+	<GraphType id="asp">
+		<!-- {{tileCount}} tiles -->
+		<SharedCode><![CDATA[
+#include <stdlib.h>
+#include <cmath>
+
+//#define LESSDEBUG
+//#define USEDEBUG
+//#define VERBOSEDEBUG
+
+int heartbeatIndex = 0;
+		]]></SharedCode>
+		
+		<Properties>
+			<Scalar name="tileCount" type="uint32_t" default="{{tileCount}}" />
+			<Scalar name="nodeCount" type="uint32_t" default="{{nodeCount}}" />
+			<Scalar name="rootCount" type="uint32_t" default="{{rootCount}}" />
+		</Properties>
+		
+		<MessageTypes>
+			<MessageType id="__init__"/>
+			<MessageType id="heartbeat" />
+			<MessageType id="finished">
+				<Message>
+					<Scalar name="avgHops" type="uint32_t" />
+					<Scalar name="fin" type="uint8_t" />
+					<Scalar name="graphInst" type="uint32_t" />
+					<Scalar name="finIdx" type="uint16_t" />
+					<Scalar name="id" type="uint32_t" />
+				</Message>
+			</MessageType>
+			<MessageType id="update">
+				<Message>
+					<Scalar name="hops" type="uint32_t" />
+					<Scalar name="rootIdx" type="uint32_t" />
+				</Message>
+			</MessageType>
+		</MessageTypes>
+
+		<DeviceTypes>
+			<DeviceType id="node">
+				<Properties>
+					<Scalar name="rootIdx" type="int32_t" default="-1" />
+					<Scalar name="hcMax" type="uint16_t" default="10" />
+					<Scalar name="graphInst" type="uint32_t" />
+					<Scalar name="id" type="uint32_t" />
+				</Properties>
+
+				<State>
+					<Scalar name="rootIdx" type="int32_t" default="-1" />
+					<Array name="updated" type="uint8_t" length="{{rootCount}}"  default="0" />
+					<Scalar name="updatePending" type="uint32_t" default="0" />
+					<Scalar name="finIdx" type="uint16_t" default="0" />
+					<Scalar name="active" type="uint8_t" default="0" />
+					<Scalar name="hc" type="uint16_t" default="0" />
+					<Scalar name="finSent" type="uint8_t" default="0" />
+					<Scalar name="fin" type="uint8_t" default="0" />
+					<Array name="buff" type="uint32_t" length="{{rootCount}}" />
+				</State>
+
+				<SharedCode><![CDATA[
+
+				]]></SharedCode>
+
+<InputPin name="__init__" messageTypeId="__init__">
+<OnReceive><![CDATA[
+// Dummy input pin to handle hacky __init stuff.
+#ifdef VERBOSEDEBUG
+handler_log(2,"P_INIT");
+#endif
+for(uint32_t i = 0; i < graphProperties->rootCount; i++) {
+	deviceState->buff[i] = 0xffffffff; // (i==deviceProperties->id) ? 0 : UINT32_MAX;
+}
+deviceState->rootIdx = deviceProperties->rootIdx;
+]]></OnReceive>
+</InputPin>
+
+				<ReadyToSend><![CDATA[
+if((deviceState->fin == 1) ^ (deviceState->finSent==1)) {
+	*readyToSend |= RTS_FLAG_finished_out;
+}
+else if((deviceState->active==0 && deviceState->rootIdx>=0) || deviceState->updatePending > 0) {
+	*readyToSend |= RTS_FLAG_update_out;
+}
+				]]></ReadyToSend>
+
+				<OnCompute><![CDATA[
+if(deviceInstance->deviceID == 0) {
+	if(heartbeatIndex > 1000) { // Execute on every tenth OnIdle.
+		heartbeatIndex = 0;
+		P_Msg_t hbMsg;
+                P_Msg_Hdr_t* hdr = &(hbMsg.header);
+
+              // Form the Pin Address
+              hdr->swAddr = ((P_ADDR_BROADCAST << P_SW_DEVICE_SHIFT) & P_SW_DEVICE_MASK);
+              hdr->pinAddr = 0;
+              hdr->pinAddr |= (((deviceInstance->numInputs-1) << P_HD_TGTPIN_SHIFT)
+                                & P_HD_TGTPIN_MASK);     //HB is last pin
+              //hdr->pinAddr |= ((0 << P_HD_DESTEDGEINDEX_SHIFT)
+              //                  & P_HD_DESTEDGEINDEX_MASK);     // Broadcast
+
+              softswitch_onReceive(deviceInstance->thread, &hbMsg);
+	}
+	else {
+		heartbeatIndex++;
+	}
+	return(1);
+}
+return(0); //GOTCHA: Surely this should be defualt behaviour?
+				]]></OnCompute>
+
+				<OutputPin messageTypeId="finished" name="finished_out">
+					<OnSend><![CDATA[
+//It's a toggle.
+if(!deviceState->finSent) { //Finished, but have not sent
+	deviceState->finIdx++; //Increment BEFORE use!!!
+	deviceState->finSent = 1;
+	message->fin = 1;
+	#ifdef USEDEBUG
+	handler_log(2,"FIN_SENT");
+	#endif
+	#ifdef LESSDEBUG
+	if(deviceInstance->deviceID == 0) {
+		handler_log(2,"FIN_SENT");
+	}
+	#endif
+}
+else { //Sent but finished cancelled
+	deviceState->finSent = 0;
+	message->fin = 0;
+	#ifdef USEDEBUG
+	handler_log(2,"FIN_CANCEL");
+	#endif
+}
+message->finIdx = deviceState->finIdx;
+
+uint32_t total = 0;
+for(uint32_t i = 0; i < graphProperties->rootCount; i++) {
+	total += deviceState->buff[i];
+}
+message->avgHops = total;// / (float)graphProperties->rootCount;
+
+message->id = deviceProperties->id;
+message->graphInst = deviceProperties->graphInst;
+					]]></OnSend>
+				</OutputPin>
+
+				<InputPin messageTypeId="update" name="update_in">
+					<OnReceive><![CDATA[
+#ifdef VERBOSEDEBUG
+handler_log(2,"UPD_IN");
+#endif
+
+if(message->rootIdx < graphProperties->rootCount) {
+	if(message->hops+1 < deviceState->buff[message->rootIdx]) {
+		deviceState->buff[message->rootIdx] = message->hops+1;
+		if(deviceState->updated[message->rootIdx] == 0) {
+			deviceState->updatePending++;
+		}
+		deviceState->updated[message->rootIdx] = 1;
+	}
+}
+					]]></OnReceive>
+				</InputPin>
+
+				<OutputPin messageTypeId="update" name="update_out">
+					<OnSend><![CDATA[
+#ifdef VERBOSEDEBUG
+handler_log(2,"UPD_OUT");
+#endif
+if(deviceState->rootIdx>=0) {
+	deviceState->buff[deviceState->rootIdx] = 0;
+	message->rootIdx = deviceState->rootIdx;
+	message->hops = 0;
+	deviceState->rootIdx = -1;
+}
+else {
+	for(uint32_t i = 0; i < graphProperties->rootCount; i++) {
+		if(deviceState->updated[i]) {
+			message->rootIdx = i;
+			message->hops = deviceState->buff[i];
+
+			deviceState->updated[i] = 0;
+			deviceState->updatePending--;
+			break;
+		}
+	}
+}
+deviceState->hc = 0;
+deviceState->active = 1;
+				]]></OnSend>
+				</OutputPin>
+        <OutputPin name="heartbeat_out" messageTypeId="heartbeat">
+          <OnSend><![CDATA[
+            // Hacky heartbeat output pin for self-connecting to avoid sanity checking.
+    #ifdef VERBOSEDEBUG
+              handler_log(2,"HB_out");
+    #endif
+          ]]></OnSend>
+        </OutputPin>
+                                <InputPin messageTypeId="heartbeat" name="heartbeat_in">
+                                        <OnReceive><![CDATA[
+if(deviceState->active && (deviceState->finSent==0)) {
+        deviceState->hc++;
+
+        #ifdef VERBOSEDEBUG
+        handler_log(2,"HB_REC");
+        #endif
+
+        if(deviceState->hc >= deviceProperties->hcMax) {
+                deviceState->fin = 1;
+        }
+}
+else {
+        #ifdef VERBOSEDEBUG
+        //handler_log(2,"HB_IGN");
+        #endif
+}
+                                        ]]></OnReceive>
+                                </InputPin>
+
+			</DeviceType>
+
+			<SupervisorDeviceType id="supervisorNode">
+
+				<Code><![CDATA[
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <cstdio>
+#include <iomanip>
+#include <cmath>
+
+//#define USEDEBUG
+//#define VERBOSEDEBUG
+
+#ifdef USEDEBUG
+#define DEBUG_PRINT(x) std::cout << std::setprecision(2) << x << std::endl
+#else
+#define DEBUG_PRINT(x) 
+#endif 
+
+#ifdef VERBOSEDEBUG
+#define VERBOSE_PRINT(x) std::cout << std::setprecision(2) << x << std::endl
+#else
+#define VERBOSE_PRINT(x) 
+#endif 
+
+uint32_t finCount = 0;
+uint8_t sentDone = 0;
+uint8_t nodesDone = 0;
+
+const uint32_t nodeCount = {{nodeCount}};
+const uint32_t tileCount = {{tileCount}};
+const uint32_t totalCount = {{totalNodeCount}};
+uint32_t loopMax = 1000;
+
+uint8_t fin[totalCount];
+uint16_t finIdx[totalCount];
+uint32_t avgHops[totalCount];
+uint32_t loopCount = 0;
+				]]></Code>
+				
+				<InputPin messageTypeId="finished" name="finished_in">
+					<OnReceive><![CDATA[
+VERBOSE_PRINT("MSG:");
+if((message->id >= nodeCount) || (message->graphInst >= tileCount)) {
+	//Something has gone horribly wrong and we have received a message for a node that can't exist.
+	DEBUG_PRINT("ERR_MSG_CELL_NE");
+}
+else {
+	uint64_t loc = (message->graphInst * nodeCount) + message->id;
+
+	if(message->fin && (message->finIdx > finIdx[loc])) {
+		//It's a finished message that is newer than what we have.
+		VERBOSE_PRINT("\tFIN:" << message->id << "@" << message->graphInst << " IDX:" << message->finIdx << " VAL:"  << message->avgHops);
+		if(!fin[loc]) { //Node is not already finished.
+			finCount++;
+		}
+		fin[loc] = 1;
+		finIdx[loc] = message->finIdx;
+		avgHops[loc] = message->avgHops;
+		#ifdef USEDEBUG
+		printf(">> avgHops[%lu] = %u\n", loc, message->avgHops);
+		#endif
+	}
+	else if(!(message->fin) && message->finIdx >= finIdx[loc]) {
+		//It's a not finished message cancelling the current or future finished message
+		VERBOSE_PRINT("\tNFIN:" << message->id << "@" << message->graphInst << " IDX:" << message->finIdx);
+		if(fin[loc]) { //Node is already finished.
+			finCount--;
+		}
+		fin[loc] = 0;
+		finIdx[loc] = message->finIdx;
+		avgHops[loc] = message->avgHops;
+		#ifdef USEDEBUG
+		printf(">> avgHops[%lu] = %u\n", loc, message->avgHops);
+		#endif
+	}
+	else {//Otherwise do nothing with the finish message as it is a duplicate.
+		VERBOSE_PRINT("\tIGNORED:" << message->id << "@" << message->graphInst << " IDX:" << message->finIdx);
+	}
+
+	VERBOSE_PRINT("\tFINCOUNT:" << finCount << "/" << totalCount);
+
+	//Periodic node count updates
+	if(loopCount == 0) {
+		DEBUG_PRINT("\tNODES_DONE: " << finCount << "/" << totalCount);
+		loopCount = loopMax;
+	}
+	loopCount--;
+	if(finCount >= totalCount) {
+		//All of the nodes have finished, do something.
+		DEBUG_PRINT("\tNODES_DONE: " << finCount);
+		//handler_log(2, "ALL NODES_DONE");
+
+		nodesDone = 1;
+		if(!sentDone) {
+			DEBUG_PRINT("\tSEND_DONE");
+			//Supervisor::outputs[0]->OnSend(outMsg, msgBuf, 1);
+		}
+
+		uint64_t sum = 0;
+		for(uint32_t i = 0; i<totalCount; i++) {
+			sum += avgHops[i];
+		}
+		printf("sum = %lu\n", sum);
+		printf("ASP = %.4lf\n", (double)sum/(double)nodeCount/(double)(nodeCount-1));
+
+		//TODO: Send Data to MPI Land. Or write to file.
+		/*
+		//Wite data to CSV
+		std::ofstream oFile;
+		std::ostringstream ss;
+		ss << "plate_" << sEdgeProperties->xSize << "x" << sEdgeProperties->ySize << "_out.csv";
+		oFile.open(ss.str());
+		DEBUG_PRINT("\tOFILE_OPEN: " << ss.str()) ;
+		//oFile.precision(2);
+		oFile << std::fixed << std::setprecision(2);
+		oFile << "x, y, temp" << std::endl;
+		DEBUG_PRINT("\tRESULTS_WRITE");
+		for(unsigned int ix = 0; ix < sEdgeProperties->xSize; ix++) {
+			loc = ix*sEdgeProperties->xSize;
+			for(unsigned int iy = 0; iy < sEdgeProperties->ySize; iy++) {
+				oFile << ix << ", " << iy << ", " << data_t[loc].t << std::endl;
+				loc++;
+			}
+		}
+		DEBUG_PRINT("\tRESULTS_WRITTEN");
+		oFile.close();
+		DEBUG_PRINT("\tOFILE_CLOSE");
+		*/
+	}
+}
+					]]></OnReceive>
+				</InputPin>
+
+			</SupervisorDeviceType>
+
+		</DeviceTypes>
+	</GraphType>
+	
+<GraphInstance id="asp" graphTypeId="asp">
+{{graphInstance}}
+</GraphInstance>
+</Graphs>
